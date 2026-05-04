@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>ALFA TV Cast Receiver</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <!-- Cast Application Framework (CAF) v3 -->
+  <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+
+  <!-- Shaka Player: soporta HLS, DASH, MP4 nativamente y MPEG-TS via mpegts.js -->
+  <script src="//cdn.jsdelivr.net/npm/shaka-player@4.10.0/dist/shaka-player.compiled.js"></script>
+
+  <!-- mpegts.js: para reproducir MPEG-TS puro (canales IPTV) -->
+  <script src="//cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.js"></script>
+
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden; }
+    cast-media-player {
+      --background: #000;
+      --splash-image: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200"><circle cx="100" cy="100" r="80" fill="%23D4A844"/><text x="100" y="115" font-size="40" fill="%23000" text-anchor="middle" font-family="Arial" font-weight="bold">ALFA</text></svg>');
+      --splash-size: cover;
+    }
+    #status {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      right: 20px;
+      color: #D4A844;
+      font-family: Arial, sans-serif;
+      font-size: 18px;
+      text-shadow: 0 2px 4px rgba(0,0,0,0.8);
+      z-index: 10;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <!-- Player nativo del CAF: maneja UI, controles, splash, etc. -->
+  <cast-media-player id="player"></cast-media-player>
+  <div id="status"></div>
+
+  <script>
+    /**
+     * ALFA TV Cast Receiver
+     *
+     * Custom receiver basado en CAF v3 que extiende el comportamiento por
+     * defecto para soportar streams IPTV (MPEG-TS) además de HLS/DASH/MP4.
+     *
+     * Estrategia:
+     *  1. Interceptar el LOAD message del sender (la app Android)
+     *  2. Detectar el tipo de contenido por URL/MIME
+     *  3. Si es HLS/DASH/MP4 → dejar que el CAF lo reproduzca normalmente
+     *  4. Si es MPEG-TS (.ts puro o sin extensión) → usar mpegts.js
+     *     manualmente sobre el <video> element del CAF
+     */
+
+    const context = cast.framework.CastReceiverContext.getInstance();
+    const playerManager = context.getPlayerManager();
+    const statusDiv = document.getElementById('status');
+
+    let mpegtsPlayer = null;
+
+    function setStatus(text) {
+      console.log('[ALFA TV]', text);
+      statusDiv.textContent = text;
+      // Limpiar después de 3s
+      setTimeout(() => { if (statusDiv.textContent === text) statusDiv.textContent = ''; }, 3000);
+    }
+
+    /**
+     * Detecta si una URL es MPEG-TS puro (no HLS).
+     * IPTV Xtream Codes típicamente usa:
+     *   http://server/USER/PASS/STREAM_ID         (sin extensión, es TS)
+     *   http://server/USER/PASS/STREAM_ID.ts      (TS explícito)
+     * vs HLS:
+     *   http://server/live/USER/PASS/STREAM_ID.m3u8
+     */
+    function isMpegTs(url) {
+      const u = url.toLowerCase().split('?')[0];
+      // Si tiene .m3u8 o .mpd, NO es MPEG-TS puro
+      if (u.includes('.m3u8') || u.includes('.mpd')) return false;
+      // Si termina en .ts → MPEG-TS
+      if (u.endsWith('.ts')) return true;
+      // Si tiene formato Xtream (3 partes después del host: USER/PASS/ID) → asumir TS
+      const xtreamPattern = /^https?:\/\/[^\/]+\/[^\/]+\/[^\/]+\/\d+(\.[a-z0-9]+)?$/;
+      if (xtreamPattern.test(u) && !u.endsWith('.mp4') && !u.endsWith('.mkv')) {
+        return true;
+      }
+      return false;
+    }
+
+    /**
+     * Reproduce un stream MPEG-TS usando mpegts.js sobre el <video>
+     * elemento que el CAF controla internamente.
+     */
+    function playMpegTs(url) {
+      // Limpiar player previo si existía
+      if (mpegtsPlayer) {
+        try { mpegtsPlayer.destroy(); } catch (e) {}
+        mpegtsPlayer = null;
+      }
+
+      // El CAF expone el <video> internamente — buscamos el elemento
+      const videoEl = document.querySelector('video') || document.querySelector('cast-media-player video');
+      if (!videoEl) {
+        setStatus('Error: no se encontró video element');
+        return false;
+      }
+
+      if (!mpegts.getFeatureList().mseLivePlayback) {
+        setStatus('MPEG-TS no soportado en este dispositivo');
+        return false;
+      }
+
+      mpegtsPlayer = mpegts.createPlayer({
+        type: 'mpegts',
+        url: url,
+        isLive: true,
+        cors: true
+      }, {
+        enableWorker: false,
+        lazyLoad: false,
+        lazyLoadMaxDuration: 3 * 60,
+        seekType: 'range',
+        autoCleanupSourceBuffer: true
+      });
+
+      mpegtsPlayer.attachMediaElement(videoEl);
+      mpegtsPlayer.load();
+      mpegtsPlayer.play();
+      setStatus('Reproduciendo TV en vivo');
+      return true;
+    }
+
+    /**
+     * Interceptor del mensaje LOAD: cuando el sender pide cargar contenido,
+     * decidimos si lo dejamos al CAF o lo manejamos nosotros con mpegts.js.
+     */
+    playerManager.setMessageInterceptor(
+      cast.framework.messages.MessageType.LOAD,
+      (loadRequestData) => {
+        const url = loadRequestData.media && loadRequestData.media.contentId;
+        const mime = loadRequestData.media && loadRequestData.media.contentType;
+
+        console.log('[ALFA TV] LOAD request:', { url, mime });
+        setStatus('Cargando: ' + (url || 'sin URL'));
+
+        if (!url) return loadRequestData;
+
+        // Si es MPEG-TS puro, manejarlo nosotros con mpegts.js
+        if (isMpegTs(url) || mime === 'video/mp2t') {
+          console.log('[ALFA TV] Detectado MPEG-TS, usando mpegts.js');
+          // Esperamos a que el video element esté listo (CAF lo crea
+          // después de procesar el LOAD).
+          setTimeout(() => playMpegTs(url), 500);
+          // Devolvemos null para que el CAF NO intente cargarlo nativamente
+          // (porque fallaría con MPEG-TS). El video element lo controla
+          // mpegts.js de aquí en adelante.
+          return null;
+        }
+
+        // Para HLS/DASH/MP4, dejar que el CAF lo maneje
+        return loadRequestData;
+      }
+    );
+
+    // Logging de eventos importantes para depuración remota
+    playerManager.addEventListener(
+      cast.framework.events.EventType.ERROR,
+      (event) => {
+        console.error('[ALFA TV] Player error:', event);
+        setStatus('Error: ' + (event.detailedErrorCode || event.error));
+      }
+    );
+
+    playerManager.addEventListener(
+      cast.framework.events.EventType.PLAYING,
+      () => setStatus('Reproduciendo')
+    );
+
+    // Iniciar el receptor con opciones
+    const options = new cast.framework.CastReceiverOptions();
+    // Aceptar cualquier mensaje sin firmar (no hay control parental ni DRM)
+    options.disableIdleTimeout = true;
+    // Dejar que el receiver siga vivo aunque el sender se desconecte
+    options.maxInactivity = 3600;
+
+    context.start(options);
+    console.log('[ALFA TV] Receiver iniciado');
+    setStatus('ALFA TV listo');
+  </script>
+</body>
+</html>
